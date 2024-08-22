@@ -1,0 +1,290 @@
+from collections import defaultdict
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+
+import darts
+from darts import TimeSeries
+from darts.models import ExponentialSmoothing, Prophet, AutoARIMA, StatsForecastAutoARIMA
+
+color_pal = sns.color_palette()
+
+"""## Getting electricity pricing data"""
+
+# https://www.seai.ie/data-and-insights/seai-statistics/key-statistics/prices/
+commercial_pricing_data = pd.read_csv('./Commercial-Electricity.csv')
+household_pricing_data = pd.read_csv('./Household-Electricity.csv')
+commercial_pricing_data.rename(columns={"Average electricity price to business (Euro cent/kWh)": "timeframe"}, inplace=True)
+household_pricing_data.rename(columns={"Average electricity price to households (Euro cent/kWh)": "timeframe"}, inplace=True)
+
+commercial_pricing_data
+
+household_pricing_data
+
+def timeframeCleaner(row):
+    try:
+        return row['timeframe'].split()[1]
+    except:
+        return row['timeframe'].split('S')[0]
+
+commercial_pricing_data['year'] = commercial_pricing_data.apply(lambda row: row['timeframe'].split('S')[0], axis=1)
+household_pricing_data['year'] = household_pricing_data.apply(timeframeCleaner, axis=1)
+
+commercial_pricing_data
+
+new_commercial_pricing_data = pd.DataFrame(columns = ['timeframe', 'Ireland', 'Euro Area', 'EU-27', 'month', 'year'])
+new_household_pricing_data = pd.DataFrame(columns = ['timeframe', 'Ireland', 'Euro Area', 'EU-27', 'month', 'year'])
+
+x = 0
+for index, row in commercial_pricing_data.iterrows():
+    if x==12:
+        x=6
+    if int(row['year'])>=2010:
+        for i in range(6):
+            row['month'] = i+x+1
+            new_commercial_pricing_data = new_commercial_pricing_data._append(row,ignore_index=True)
+        x+=6
+
+x = 0
+for index, row in household_pricing_data.iterrows():
+    if x==12:
+        x=6
+    if int(row['year'])>=2010:
+        for i in range(6):
+            row['month'] = i+x+1
+            new_household_pricing_data = new_household_pricing_data._append(row,ignore_index=True)
+        x+=6
+
+new_commercial_pricing_data
+
+new_household_pricing_data
+
+"""## Getting the data and cleaning it"""
+
+df = pd.read_csv("./monthly_full_release_long_format-4.csv")
+df['Date'] = pd.to_datetime(df['Date'])
+
+# Feature Creation
+df['quarter'] = df.apply(lambda row: row.Date.quarter, axis=1)
+df['month'] = df.apply(lambda row: row.Date.month, axis=1)
+df['year'] = df.apply(lambda row: row.Date.year, axis=1)
+df['Timestamp'] = df.apply(lambda row: int(round(row.Date.timestamp())), axis=1)
+
+df
+
+ireland_data = df.loc[df['Area'] == 'Ireland']
+
+ireland_data.to_csv('ireland_data.csv', index=False)
+
+# Unique values in each column
+dictCols = {}
+for col in ireland_data:
+    dictCols[col] = ireland_data[col].unique()
+
+dictCols
+
+# As observed above, some columns only have one unique value, so don't really add value to our forcasting model,
+# so we will drop those columns.
+ireland_data = ireland_data.drop(columns=['Area', 'Country code', 'Area type', 'Continent', 'Ember region', 'EU', 'OECD', 'G20', 'G7', 'ASEAN'])
+ireland_data.head()
+
+"""## Extracting relevant data and plotting it
+
+### Ireland Demand Data
+"""
+
+ireland_demand_data = ireland_data.loc[ireland_data['Category'] == 'Electricity demand']
+ireland_demand_data.set_index('Date', inplace=True)
+ireland_demand_data.plot(y="Value")
+
+ireland_demand_data.head(30)
+
+ireland_demand_data['commercial_average_price'] = new_commercial_pricing_data.Ireland[:-1].to_numpy()
+ireland_demand_data['household_average_price'] = new_household_pricing_data.Ireland[:-1].to_numpy()
+
+ireland_demand_data
+
+ireland_demand_data.to_csv('ireland_demand_data.csv', index=False)
+
+ireland_demand_data['commercial_average_price'].corr(ireland_demand_data['Value'])
+
+ireland_demand_data.drop(columns=['Subcategory', 'Variable', 'Unit', 'Category']).corr()
+
+# calculate the correlation matrix on the numeric columns
+corr = ireland_demand_data.drop(columns=['Subcategory', 'Variable', 'Unit', 'Category','YoY absolute change', 'YoY % change']).select_dtypes('number').corr()
+
+# plot the heatmap
+sns.heatmap(corr)
+
+cmap = sns.diverging_palette(5, 250, as_cmap=True)
+
+def magnify():
+    return [dict(selector="th",
+                 props=[("font-size", "7pt")]),
+            dict(selector="td",
+                 props=[('padding', "0em 0em")]),
+            dict(selector="th:hover",
+                 props=[("font-size", "12pt")]),
+            dict(selector="tr:hover td:hover",
+                 props=[('max-width', '200px'),
+                        ('font-size', '12pt')])
+]
+
+corr.style.background_gradient(cmap, axis=1)\
+    .format(precision=3)\
+    .set_properties(**{'max-width': '80px', 'font-size': '10pt'})\
+    .set_caption("Correlation Matrix")\
+    .set_table_styles(magnify())
+
+"""### Ireland Generation Data"""
+
+ireland_generation_data = ireland_data.loc[ireland_data['Category'] == 'Electricity generation']
+
+ireland_generation_fuel_data = ireland_generation_data.loc[ireland_generation_data['Subcategory']=='Fuel']
+ireland_generation_fuel_twh_data = ireland_generation_fuel_data.loc[ireland_generation_fuel_data['Unit']=='TWh']
+
+ireland_generation_data.head()
+
+fig, ax = plt.subplots(figsize=(20,10))
+
+for name, group in ireland_generation_fuel_twh_data.groupby('Variable'):
+    group.plot(x='Date', y='Value', ax=ax, label=name)
+
+plt.show()
+
+fig, ax = plt.subplots(figsize=(10,8))
+sns.boxplot(data=ireland_demand_data, x = 'month', y = 'Value', palette = 'Blues')
+ax.set_title('Demand by Month')
+plt.show()
+
+"""## Model Creation and Training"""
+
+#our data:
+ireland_demand_data
+
+print('Subcategory:',ireland_demand_data.Subcategory.unique())
+print('Variable:',ireland_demand_data.Variable.unique())
+print('Unit:',ireland_demand_data.Unit.unique())
+print('Category:',ireland_demand_data.Category.unique())
+
+X_train, X_test, y_train, y_test = train_test_split(ireland_demand_data.drop(columns=['Subcategory', 'Variable', 'Unit', 'Category','Value'], axis=1), ireland_demand_data['Value'], test_size=.2, shuffle=False)
+
+"""## XGBoost"""
+
+# create model instance
+reg = xgb.XGBRegressor() #early_stopping_rounds=50
+reg.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=True)
+
+fi = pd.DataFrame(data=reg.feature_importances_, index=reg.feature_names_in_, columns=['importances'])
+
+fi.sort_values('importances').plot(kind='barh', title='Feature Importance')
+plt.show()
+
+"""### Forcast on test"""
+
+X_test_predictions = reg.predict(X_test)
+
+future = pd.date_range('2023-11-01', '2033-11-01', freq='MS')
+future_df = pd.DataFrame({'Date':future})
+
+future_df['Timestamp'] = future_df.apply(lambda row: int(round(row.Date.timestamp())), axis=1)
+
+future_df.set_index('Date', inplace=True)
+
+future_concat_df = pd.concat([ireland_demand_data, future_df])
+
+future_concat_df
+
+future_preds = reg.predict(future_concat_df.drop(columns=['Subcategory', 'Variable', 'Unit', 'Category','Value'], axis=1))
+
+future_concat_df['predictions'] = future_preds
+
+future_concat_df
+
+ax = future_concat_df[['Value']].plot(figsize=(15,5))
+future_concat_df['predictions'].plot(ax=ax)
+plt.legend(['Truth Data', 'Predictions'])
+ax.set_title('Raw Data and Predictions')
+plt.show()
+
+y_test = pd.DataFrame(y_test)
+
+y_test['predictions'] = X_test_predictions
+
+ireland_demand_data = ireland_demand_data.merge(y_test[['predictions']], how='left', left_index=True, right_index=True)
+
+ax = ireland_demand_data[['Value']].plot(figsize=(15,5))
+ireland_demand_data['predictions'].plot(ax=ax)
+plt.legend(['Truth Data', 'Predictions'])
+ax.set_title('Raw Data and Predictions')
+plt.show()
+
+#Mean squared error for our model:
+score = np.sqrt(mean_squared_error(ireland_demand_data.Value, reg.predict(ireland_demand_data.drop(columns=['Subcategory','Variable','Unit','Category','Value','predictions']))))
+print("RMSE:", score)
+
+ireland_demand_data
+
+ireland_demand_data['Date'] = ireland_demand_data.index
+
+# Create a TimeSeries, specifying the time and value columns
+series = TimeSeries.from_dataframe(ireland_demand_data, 'Date', "Value")
+# incase shit hits the fan: fill_missing_dates=True, freq="MS"
+
+# Set aside the last 36 months as a validation series
+train, val = series[:-36], series[-36:]
+
+train
+
+"""## Exponential Smoothening"""
+
+model_exponential_smoothing = ExponentialSmoothing()
+model_exponential_smoothing.fit(train)
+prediction_exponential_smoothing = model_exponential_smoothing.predict(len(val), num_samples=1000)
+print("RMSE Score:",darts.metrics.metrics.rmse(val, prediction_exponential_smoothing))
+series.plot()
+prediction_exponential_smoothing.plot(label="forecast", low_quantile=0.05, high_quantile=0.95)
+plt.legend()
+
+"""## Prophet"""
+
+model_Prophet = Prophet()
+model_Prophet.fit(train)
+prediction_Prophet = model_Prophet.predict(len(val), num_samples=1000)
+prediction_Prophet_raw = model_Prophet.predict_raw(len(val))
+print("RMSE Score:",darts.metrics.metrics.rmse(val, prediction_Prophet))
+series.plot()
+prediction_Prophet.plot(label="forecast", low_quantile=0.05, high_quantile=0.95)
+plt.legend()
+
+prediction_Prophet_raw
+
+real_values = list(map(lambda v: v[0], list(val.values())))
+
+comp = pd.DataFrame({'Date':prediction_Prophet_raw['ds'],'Real Value':real_values, 'predicted_value':prediction_Prophet_raw['yhat']})
+
+comp
+
+comp.to_csv('predicted_vs_real.csv', index=False)
+
+"""## AutoARIMA"""
+
+model_AutoARIMA = StatsForecastAutoARIMA()
+model_AutoARIMA.fit(train)
+prediction_AutoARIMA = model_AutoARIMA.predict(len(val), num_samples=1000)
+print("RMSE Score:",darts.metrics.metrics.rmse(val, prediction_AutoARIMA))
+series.plot()
+prediction_AutoARIMA.plot(label="forecast", low_quantile=0.05, high_quantile=0.95)
+plt.legend()
+
+"""### Considering above RMSE scores, let's use PROPHET to forcast for the next few years:"""
+
+prediction_Prophet = model_Prophet.predict(200, num_samples=1000)
+series.plot()
+prediction_Prophet.plot(label="forecast", low_quantile=0.05, high_quantile=0.95)
+plt.legend()
+
